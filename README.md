@@ -11,6 +11,7 @@ Pipework uses cgroups and namespace and works with "plain" LXC containers
 **Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
 
 - [Things to note](#things-to-note)
+  - [vCenter / vSphere / ESX / ESXi](#vcenter--vsphere--esx--esxi)
   - [Virtualbox](#virtualbox)
   - [Docker](#docker)
 - [LAMP stack with a private network between the MySQL and Apache containers](#lamp-stack-with-a-private-network-between-the-mysql-and-apache-containers)
@@ -29,6 +30,7 @@ Pipework uses cgroups and namespace and works with "plain" LXC containers
 - [DHCP Options](#dhcp-options)
 - [Specify a custom MAC address](#specify-a-custom-mac-address)
 - [Virtual LAN (VLAN)](#virtual-lan-vlan)
+- [Control routes](#routes)
 - [Support Open vSwitch](#support-open-vswitch)
 - [Support InfiniBand IPoIB](#support-infiniband-ipoib)
 - [Cleanup](#cleanup)
@@ -37,17 +39,32 @@ Pipework uses cgroups and namespace and works with "plain" LXC containers
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
-
-
 ### Things to note
 
-#### Virtualbox
+#### vCenter / vSphere / ESX / ESXi
+**If you use vCenter / VSphere / ESX / ESXi,** set or ask your administrator
+to set *Network Security Policies* of the vSwitch as below:
 
+- Promiscuous mode:    **Accept**
+- MAC address changes: **Accept**
+- Forged transmits:    **Accept**
+
+After starting the guest OS and creating a bridge, you might also need to
+fine-tune the `br1` interface as follows:
+
+- `brctl stp br1 off` (to disable the STP protocol and prevent the switch
+  from disabling ports)
+- `brctl setfd br1 2` (to reduce the time taken by the `br1` interface to go
+  from *blocking* to *forwarding* state)
+- `brctl setmaxage br1 0`
+
+#### Virtualbox
 **If you use VirtualBox**, you will have to update your VM network settings.
 Open the settings panel for the VM, go the the "Network" tab, pull down the
 "Advanced" settings. Here, the "Adapter Type" should be `pcnet` (the full
 name is something like "PCnet-FAST III"), instead of the default `e1000`
 (Intel PRO/1000). Also, "Promiscuous Mode" should be set to "Allow All".
+
 If you don't do that, bridged containers won't work, because the virtual
 NIC will filter out all packets with a different MAC address.  If you are
 running VirtualBox in headless mode, the command line equivalent of the above
@@ -60,6 +77,10 @@ config.vm.provider "virtualbox" do |v|
   v.customize ['modifyvm', :id, '--nicpromisc1', 'allow-all']
 end
 ```
+
+Note: it looks like some operating systems (e.g. CentOS 7) do not support
+`pcnet` anymore. You might want to use the `virtio-net` (Paravirtualized
+Network) interface with those.
 
 
 #### Docker
@@ -295,6 +316,31 @@ through extra hoops if you want it to work properly.
 
 It works fine on plain old wired Ethernet, though.
 
+#### Lease Renewal
+
+All of the DHCP options - udhcpc, dhcp, dhclient, dhcpcd - exit or are killed by pipework when they are done assigning a lease. This is to prevent zombie processes from existing after a container exits, but the dhcp client still exists.
+
+However, if the container is long-running - longer than the life of the lease - then the lease will expire, no dhcp client renews the lease, and the container is stuck without a valid IP address.
+
+To resolve this problem, you can cause the dhcp client to remain alive. The method depends on the dhcp client you use.
+
+* dhcp: see the next section [DHCP Options](#dhcp-options)
+* dhclient: use DHCP client `dhclient-f`
+* udhcpc: use DHCP client `udhcpc-f`
+* dhcpcd: not yet supported.
+
+
+**Note:** If you use this option *you* will be responsible for finding and killing those dhcp client processes in the future. pipework is a one-time script; it is not intended to manage long-running processes for you.
+
+In order to find the processes, you can look for pidfiles in the following locations:
+
+* dhcp: see the next section [DHCP Options](#dhcp-options)
+* dhclient: pidfiles in `/var/run/dhclient.$GUESTNAME.pid`
+* udhcpc: pidfiles in `/var/run/udhcpc.$GUESTNAME.pid`
+* dhcpcd: not yet supported
+
+`$GUESTNAME` is the name or ID of the guest as you passed it to pipework on instantiation.
+
 
 ### DHCP Options
 
@@ -383,6 +429,18 @@ ovs0 and attach the container to VLAN ID 10.
 
     pipework ovsbr0 $(docker run -d zerorpcworker) dhcp @10
 
+### Control Routes
+
+If you want to add/delete/replace routes in the container, you can run any iproute2 route command via pipework.
+
+All you have to do is set the interface to be `route`, followed by the container ID or name, followed by the route command.
+
+Here are some examples.
+
+    pipework route $CONTAINERID add 10.0.5.6/24 via 192.168.2.1
+    pipework route $CONTAINERID replace default via 10.2.3.5.78
+
+Everything after the container ID (or name) will be run as an argument to `ip route` inside the container's namespace. Use the iproute2 man page.
 
 ### Support Open vSwitch
 
@@ -408,6 +466,16 @@ The following will attach a container to ib0
 The following will do the same but connect it to ib0 with pkey 0x8001
 
     pipework ib0 $CONTAINERID 10.10.10.10/24 @8001
+
+### Gratuitous ARP
+
+If `arping` is installed, it will be used to send a gratuitous ARP reply
+to the container's neighbors. This can be useful if the container doesn't
+emit any network traffic at all, and seems unreachable (but suddenly becomes
+reachable after it generates some traffic).
+
+Note, however, that Ubuntu/Debian distributions contain two different `arping`
+packages. The one you want is `iputils-arping`.
 
 
 ### Cleanup
